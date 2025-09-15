@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live Captions (Heb → Eng) — Soniox</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --lines: 3;                 /* default line clamp (2 or 3) */
+      --font-size: 6vw;           /* scalable font size */
+      --side-padding: 4vw;        /* safe margins for capture */
+      --line-height: 1.15;        /* compact lines for captions */
+      --shadow: 0 0 0.2em #000, 0 0 0.4em #000;
+    }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans", "Helvetica Neue", sans-serif;
+      cursor: none; /* cleaner for capture; UI shows cursor itself */
+    }
+    #stage {
+      position: fixed; inset: 0;
+      display: grid;
+      grid-template-rows: 1fr auto;
+    }
+    #captionWrap {
+      display: grid;
+      place-items: end center;   /* bottom-center like broadcast */
+      padding: 6vh var(--side-padding);
+    }
+    #captions {
+      font-weight: 800;
+      font-size: var(--font-size);
+      line-height: var(--line-height);
+      text-align: center;
+      color: #fff;
+      text-shadow: var(--shadow);
+      -webkit-line-clamp: var(--lines);
+      -webkit-box-orient: vertical;
+      display: -webkit-box;
+      overflow: hidden;
+      /* a little stroke for readability on bright video */
+      filter: drop-shadow(0 0 0.15em #000);
+      max-width: 92vw;
+      user-select: none;
+    }
+    #ui {
+      display: flex; gap: .75rem; align-items: center; justify-content: center;
+      padding: .6rem .8rem 1rem;
+      background: linear-gradient(180deg, rgba(0,0,0,.0), rgba(0,0,0,.55));
+      font-size: 14px; line-height: 1;
+    }
+    #ui * { font-family: inherit; }
+    .btn, select, input[type="number"] {
+      background:#111; color:#fff; border:1px solid #333; border-radius:10px; padding:.5rem .8rem;
+    }
+    .btn[aria-pressed="true"] { background:#1f3; color:#000; border-color:#6f9; }
+    .pill { border-radius:999px; }
+    .group{display:flex; gap:.4rem; align-items:center; padding:.3rem .4rem; background:#0a0a0a; border:1px solid #222; border-radius:999px;}
+    .small{font-size:12px; opacity:.8;}
+    .hidden { display:none !important; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="captionWrap">
+      <div id="captions" aria-live="polite" aria-atomic="true">…</div>
+    </div>
+
+    <div id="ui">
+      <button id="startBtn" class="btn pill">▶ Start (Heb → Eng)</button>
+      <button id="stopBtn"  class="btn pill" disabled>■ Stop</button>
+
+      <div class="group">
+        <span class="small">Lines</span>
+        <button id="twoLines"  class="btn pill">2</button>
+        <button id="threeLines" class="btn pill" aria-pressed="true">3</button>
+      </div>
+
+      <div class="group">
+        <label class="small" for="font">Font</label>
+        <input id="font" type="range" min="24" max="160" value="96" />
+      </div>
+
+      <div class="group">
+        <label class="small" for="margin">Margin</label>
+        <input id="margin" type="range" min="0" max="10" value="4" />
+      </div>
+
+      <div class="group">
+        <label class="small" for="latency">Latency</label>
+        <select id="latency">
+          <option value="endpoint">Lowest (endpoint detect)</option>
+          <option value="normal" selected>Balanced</option>
+          <option value="stable">More stable</option>
+        </select>
+      </div>
+
+      <button id="fullscreenBtn" class="btn pill">⛶ Fullscreen (F)</button>
+      <button id="hideUiBtn"    class="btn pill">Hide UI (H)</button>
+      <span id="status" class="small" style="min-width:10ch;text-align:center;">idle</span>
+    </div>
+  </div>
+
+  <!-- Soniox Web SDK (ES module via CDN) -->
+  <script type="module">
+    import { SonioxClient } from 'https://unpkg.com/@soniox/speech-to-text-web?module';
+
+    // ====== CONFIG ======
+    // You provided this key for local use; keep this file private.
+    const SONIOX_API_KEY = "9bad56506402f0a110c0463c6899d475f678a7211771cb7ec9f4c4c661404359";
+
+    // STT model: current real-time preview (per docs)
+    const MODEL = "stt-rt-preview"; // update if Soniox promotes a stable model name
+
+    // Prefer Hebrew hint for better recognition, translate to English
+    const LANGUAGE_HINTS = ["he"];
+
+    // ====== UI ELEMENTS ======
+    const captionsEl     = document.getElementById('captions');
+    const startBtn       = document.getElementById('startBtn');
+    const stopBtn        = document.getElementById('stopBtn');
+    const twoLinesBtn    = document.getElementById('twoLines');
+    const threeLinesBtn  = document.getElementById('threeLines');
+    const fontRange      = document.getElementById('font');
+    const marginRange    = document.getElementById('margin');
+    const latencySelect  = document.getElementById('latency');
+    const fullscreenBtn  = document.getElementById('fullscreenBtn');
+    const hideUiBtn      = document.getElementById('hideUiBtn');
+    const statusEl       = document.getElementById('status');
+    const uiEl           = document.getElementById('ui');
+
+    let sonioxClient = null;
+    let bufferText = "";   // live rolling text (translation)
+    let isHidingUI = false;
+
+    // Helper: set status label
+    function setStatus(text) { statusEl.textContent = text; }
+
+    // Helper: render text into 2–3 clamped lines (CSS handles clamp).
+    function render(text) {
+      captionsEl.textContent = text || " ";
+    }
+
+    // Helper: compact rolling lines—keep only the last ~18–22 words
+    function clampWords(text, maxWords = 20) {
+      const words = text.trim().split(/\s+/);
+      if (words.length <= maxWords) return text.trim();
+      return words.slice(words.length - maxWords).join(' ');
+    }
+
+    // Map latency preference to options
+    function latencyOptions(mode) {
+      switch (mode) {
+        case 'endpoint': // lowest latency, finalize quickly
+          return {
+            enableEndpointDetection: true
+          };
+        case 'stable':   // fewer flickers, slightly higher latency
+          return {
+            enableEndpointDetection: false
+          };
+        default:         // balanced
+          return {
+            enableEndpointDetection: true
+          };
+      }
+    }
+
+    // Start streaming & translation (Heb → Eng)
+    async function start() {
+      if (sonioxClient) return;
+
+      // Tweak mic constraints for stage pickup (tune as needed)
+      const audioConstraints = {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1
+      };
+
+      sonioxClient = new SonioxClient({
+        apiKey: SONIOX_API_KEY,
+        onStarted: () => setStatus("recording…"),
+        onFinished: () => setStatus("finished"),
+        onStateChange: ({ newState }) => {
+          // newState: "idle" | "connecting" | "recording" | "stopping"
+          // We already surface a simple status above.
+        },
+        onError: (status, message) => {
+          console.error("Soniox error:", status, message);
+          setStatus(`error: ${status}`);
+          stop(true);
+        }
+      });
+
+      bufferText = "";
+      render("");
+
+      const opts = {
+        model: MODEL,
+        languageHints: LANGUAGE_HINTS,
+        translation: { type: "one_way", target_language: "en" },
+        ...latencyOptions(latencySelect.value),
+        audioConstraints,
+        onPartialResult: (res) => {
+          // res.tokens = array of tokens; when translation is enabled,
+          // tokens for translated stream include translation_status: "translation".
+          // Build a clean rolling string from finalized tokens first, fall back to all text.
+          // We simply concatenate `text` fields in order.
+          const tokens = Array.isArray(res.tokens) ? res.tokens : [];
+
+          // Prefer translated tokens (translation_status === 'translation'); else use all.
+          const translated = tokens.filter(t => t.translation_status === 'translation');
+          const use = translated.length ? translated : tokens;
+
+          // Join token texts that exist
+          const newChunk = use.map(t => t.text).filter(Boolean).join(' ').trim();
+          if (!newChunk) return;
+
+          bufferText = clampWords((bufferText + " " + newChunk).replace(/\s+/g, ' '));
+          render(bufferText);
+        }
+      };
+
+      try {
+        await sonioxClient.start(opts);
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        setStatus("recording…");
+      } catch (e) {
+        console.error(e);
+        setStatus("start failed");
+        sonioxClient = null;
+      }
+    }
+
+    async function stop(isError=false) {
+      if (!sonioxClient) return;
+      try {
+        await sonioxClient.stop(); // graceful finalize
+      } catch(e) {
+        // ignore
+      }
+      sonioxClient = null;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      if (!isError) setStatus("stopped");
+    }
+
+    // ====== UI handlers ======
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', () => stop(false));
+
+    twoLinesBtn.addEventListener('click', () => {
+      document.documentElement.style.setProperty('--lines', 2);
+      twoLinesBtn.setAttribute('aria-pressed', 'true');
+      threeLinesBtn.removeAttribute('aria-pressed');
+    });
+    threeLinesBtn.addEventListener('click', () => {
+      document.documentElement.style.setProperty('--lines', 3);
+      threeLinesBtn.setAttribute('aria-pressed', 'true');
+      twoLinesBtn.removeAttribute('aria-pressed');
+    });
+
+    fontRange.addEventListener('input', (e) => {
+      const px = Number(e.target.value);
+      // convert px to vw-ish by dividing by 16 (rough), but keep simple: set in px
+      // For super-consistent capture sizing, use px:
+      document.documentElement.style.setProperty('--font-size', px + 'px');
+    });
+
+    marginRange.addEventListener('input', (e) => {
+      document.documentElement.style.setProperty('--side-padding', e.target.value + 'vw');
+    });
+
+    latencySelect.addEventListener('change', () => {
+      // takes effect next start
+    });
+
+    fullscreenBtn.addEventListener('click', () => {
+      document.documentElement.requestFullscreen?.();
+    });
+
+    hideUiBtn.addEventListener('click', () => {
+      isHidingUI = !isHidingUI;
+      uiEl.classList.toggle('hidden', isHidingUI);
+      document.body.style.cursor = isHidingUI ? 'none' : 'default';
+    });
+
+    // Keyboard shortcuts: F fullscreen, H hide UI, space start/stop
+    window.addEventListener('keydown', (e) => {
+      if (e.key.toLowerCase() === 'f') fullscreenBtn.click();
+      if (e.key.toLowerCase() === 'h') hideUiBtn.click();
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (startBtn.disabled) stopBtn.click(); else startBtn.click();
+      }
+      if (e.key === '2') twoLinesBtn.click();
+      if (e.key === '3') threeLinesBtn.click();
+    });
+
+    // Start with a clean screen and cursor visible until you hide UI
+    setStatus('idle — press Start');
+    render('');
+    document.body.style.cursor = 'default';
+  </script>
+</body>
+</html>
